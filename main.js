@@ -1,18 +1,22 @@
 var fs = require('fs');
 var util = require('util');
 var url = require('url');
-var log = require('winston');
+var logger = require('winston');
 var async = require('async');
 var cheerio = require('cheerio');
 var request = require('request');
 var minimist = require('minimist');
 var _s = require('underscore.string');
 var n3 = require('n3');
+var csvWriter = require('csv-write-stream')({ newline: '\r\n' });
 
 var endpoint = 'http://referensi.data.kemdikbud.go.id/index11.php';
-var schools = [];
+// var schools = [];
+
+var maxRetries = 10;
 
 var outputTurtle = 'schools.ttl';
+var outputCSV = 'schools.csv';
 
 var rdfNS = 'http://www.w3.org/1999/02/22-rdf-syntax-ns#';
 var rdfsNS = 'http://www.w3.org/2000/01/rdf-schema#';
@@ -37,7 +41,11 @@ var prefixes = {
 var writeStreamTurtle = fs.createWriteStream(outputTurtle);
 var triples = new n3.Writer(writeStreamTurtle, prefixes);
 
+var writeStreamCSV = fs.createWriteStream(outputCSV);
+csvWriter.pipe(writeStreamCSV);
+
 var argv = minimist(process.argv.slice(2));
+
 if (argv.threshold) {
   var threshold = argv.threshold;
 }
@@ -48,20 +56,51 @@ else {
   var threshold = 1;
 }
 
+var timeout = argv.timeout || 5000;
+
+logger.remove(logger.transports.Console);
+logger.add(logger.transports.Console, {
+  level: argv.v ? 'verbose' : 'info',
+  colorize: true,
+  timestamp: true
+});
+if (argv.log) {
+  logger.add(logger.transports.File, {
+    level: 'verbose',
+    filename: argv.log
+  });
+}
+
 // province is in the form { url: [url], name: [name] }
 
 var pageQueue = async.queue(function processPage(page, callback) {
   // page is an object referring to a page on the endpoint
-  log.info('Processing page: ' + page.name + ' (' + page.url + ')');
+  logger.info('Loading page: ' + page.name + ' (' + page.url + ')...');
 
   var absoluteURL = url.resolve(endpoint, page.url);
 
-  request(absoluteURL, function processPageResponse(err, results, body) {
+  request({
+    url: absoluteURL,
+    timeout: timeout,
+    headers: {
+      'User-Agent': 'request/2.34.1 (Crawler untuk Tugas Akhir. Mohon maaf apabila mengganggu.)'
+    }
+  }, function processPageResponse(err, results, body) {
     if (err) {
-      log.error(err);
+      logger.error('Failed loading ' + page.name + ' (' + page.url + '): ' + err);
+
+      if (!page.retries || page.retries <= maxRetries) {
+        page.retries = page.retries ? page.retries + 1 : 1;
+        logger.warn('Re-entering ' + page.name + ' (' + page.url + ') to queue. (Retry #' + page.retries + ')');
+        pageQueue.push(page);
+        callback();
+      }
+      else {
+        logger.error('Maximum number of retries reached for ' + page.name + ' (' + page.url + ').');
+      }
     }
     else {
-      log.info('Successfully loaded ' + page.name + ' (' + page.url + ')');
+      logger.info('Successfully loaded page: ' + page.name + ' (' + page.url + ').');
       var $ = cheerio.load(body);
 
       if (page.level == 'school') {
@@ -75,7 +114,7 @@ var pageQueue = async.queue(function processPage(page, callback) {
 }, threshold);
 
 function processSchool($, page, callback) {
-  log.info('Processing school NPSN ' + page.name);
+  logger.info('Processing school NPSN=' + page.name + '...');
 
   var npsn = page.name;
   var schoolData = {};
@@ -111,13 +150,17 @@ function processSchool($, page, callback) {
 
   // RDF processing
   processSchoolRDF(schoolData);
-  schools.push(schoolData);
+  csvWriter.write(schoolData);
+  // schools.push(schoolData);
+
+
+  logger.info('Finished processing school NPSN=' + page.name + '.');
 
   callback();
 }
 
 function processRegion($, page, callback) {
-  log.info('Processing ' + page.level + ': ' + page.name);
+  logger.info('Processing ' + page.level + ': ' + page.name);
 
   var currentLevel = page.level;
   if (!currentLevel) {
@@ -140,19 +183,23 @@ function processRegion($, page, callback) {
     var links = $('#box-table-a tbody a');
   }
 
+  var subQueue = [];
   links.each(function(i, element) {
     var a = $(element);
     var url = a.attr('href');
     var name = a.text().trim();
 
-    log.info('Adding page ' + name + ' to queue...');
-    pageQueue.push({
+    subQueue.push({
       level: nextLevel,
       url: url,
       name: name,
       parent: page
     });
+    logger.verbose('Added page ' + name + ' to queue.');
   });
+
+  pageQueue.push(subQueue);
+  logger.info('Added ' + subQueue.length + ' pages to queue.');
 
   callback();
 }
@@ -218,14 +265,14 @@ function canonicalPlaceURI(schoolData) {
       regency = 'Kabupaten Administrasi ' + regency.substring(4);
     }
     else {
-      regency = regency.substring(4);
+      regency = 'Kabupaten ' + regency.substring(4).trim();
     }
   }
   else if (isDKI) {
-    regency = 'Kota Administrasi' + regency.substring(5);
+    regency = 'Kota Administrasi ' + regency.substring(5).trim();
   }
 
-  district = district.substring(4);
+  district = district.substring(4).trim();
 
   var canonicalProvince = _s.slugify(province);
   var canonicalRegency = _s.slugify(regency);
@@ -240,12 +287,21 @@ function canonicalPlaceURI(schoolData) {
 }
 
 pageQueue.drain = function () {
-  fs.writeFileSync('schools.json', JSON.stringify(schools, null, '  '));
+  // fs.writeFileSync('schools.json', JSON.stringify(schools, null, '  '));
   triples.end();
 }
 
 // Begin the queue and let the magic begin
+logger.info('Welcome to Dapodik crawler!');
+logger.info('Request timeout is set to ' + timeout + 'ms');
+logger.info('Outputting Turtle RDF data to ' + outputTurtle);
+logger.info('Outputting CSV data to ' + outputCSV);
+if (argv.log)
+  logger.info('Outputting verbose log data to ' + argv.log);
+
 pageQueue.push({
   url: endpoint,
+  // url: 'http://referensi.data.kemdikbud.go.id/index11.php?kode=060101&level=3',
+  // level: 'district',
   name: 'INDONESIA'
 });
